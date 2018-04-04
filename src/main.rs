@@ -21,13 +21,13 @@ fn main() {
         let tcp_offset = ip4_offset + 4 * ip4.get_header_length() as usize;
         let tcp = tcp::TcpPacket::new(&packet.data[tcp_offset..]).unwrap();
 
-        println!("TCP data {:?}:{:?} -> {:?}:{:?}",
-                ip4.get_source(), tcp.get_source(),
-                ip4.get_destination(), tcp.get_destination());
         // Ditto for TCP data offset.
         let data_offset = tcp_offset + 4 * tcp.get_data_offset() as usize;
         let data = &packet.data[data_offset..];
 
-        println!("{:?}", data);
+        println!("TCP data {:?}:{:?} -> {:?}:{:?}\n{:?}",
+                ip4.get_source(), tcp.get_source(),
+                ip4.get_destination(), tcp.get_destination(),
+                data);
     }
 }
