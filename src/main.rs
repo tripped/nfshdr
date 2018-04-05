@@ -106,7 +106,9 @@ impl<'a> OncRpcMessage<'a> {
     }
 
     /// Return the fragment length.
-    pub fn fragment_length(&self) -> u32 { u32be_to_host(self.data, 4) }
+    pub fn fragment_length(&self) -> u32 {
+        u32be_to_host(self.data, 0) & 0x7FFFFFFF
+    }
 
     /// Return the RPC XID.
     pub fn xid(&self) -> u32 { u32be_to_host(self.data, 4) }
