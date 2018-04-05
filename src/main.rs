@@ -162,10 +162,78 @@ impl<'a> OncRpcMessage<'a> {
     }
 }
 
+/// A wrapper for u8 slices that provides an impl for LowerHex/UpperHex.
+/// Control of the hex dump output is done by providing formatting flags;
+/// "width" and "precision" are overloaded to mean "octets per row," and
+/// "octets per group." E.g., the format specifier {:16.1x} would result
+/// in output like this:
+///
+///     00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f
+///     10 11 12 13 14 15 16 17 18 19 1a 1b 1c 1d 1e 1f
+///
+/// And {:8.2x} would produce output like this:
+///
+///     0001 0203 0405 0607
+///     0809 0a0b 0c0d 0e0f
+///
+/// Zero values (e.g., {:0.0x}) disable rowbreaks and grouping, respectively:
+///
+///     000102030405060708090a0b0c0d0e0f...
+///
+struct HexDump<'a>(&'a [u8]);
+
+impl<'a> HexDump<'a> {
+    fn fmt(&self, fmtr: &mut std::fmt::Formatter, uppercase: bool)
+            -> Result<(), std::fmt::Error> {
+        let octets_per_row = fmtr.width().unwrap_or(0);
+        let octets_per_group = fmtr.precision().unwrap_or(0);
+        let mut in_row = 0;
+        let mut in_group = 0;
+        for (i, octet) in self.0.iter().enumerate() {
+            if uppercase {
+                try!(fmtr.write_fmt(format_args!("{:02X}", octet)));
+            } else {
+                try!(fmtr.write_fmt(format_args!("{:02x}", octet)));
+            }
+
+            // Don't add trailing space or newline!
+            if i+1 == self.0.len() { break; }
+
+            in_row += 1;
+            in_group += 1;
+            if octets_per_row != 0 && in_row == octets_per_row {
+                try!(fmtr.write_str("\n"));
+                in_row = 0;
+                in_group = 0;
+            }
+            if octets_per_group != 0 && in_group == octets_per_group {
+                try!(fmtr.write_str(" "));
+                in_group = 0;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<'a> std::fmt::LowerHex for HexDump<'a> {
+    fn fmt(&self, fmtr: &mut std::fmt::Formatter)
+            -> Result<(), std::fmt::Error> {
+        self.fmt(fmtr, false)
+    }
+}
+
+impl<'a> std::fmt::UpperHex for HexDump<'a> {
+    fn fmt(&self, fmtr: &mut std::fmt::Formatter)
+            -> Result<(), std::fmt::Error> {
+        self.fmt(fmtr, true)
+    }
+}
+
 fn main() {
     // XXX: yeah, yeah, yeah, use try!
     let mut cap = Capture::from_raw_fd(0).unwrap();
 
+    let mut i = 0;
     while let Ok(packet) = cap.next() {
         // Unpack the delicious, meaty 5-layer burrito of NFS traffic.
         // We have the application layer beef and chicken combo (NFS inside
@@ -184,11 +252,26 @@ fn main() {
         // drop packets on capture. This problem can be solved, of course,
         // e.g., by keeping separate buffers for raw packets and TCP data
         // which are maintained by threads running on different CPUs.)
+
+        i += 1;
+
         if let Some(rpc) = OncRpcMessage::new(data) {
-            if rpc.looks_like_it_be_what_it_is() {
-                println!("{:?}", rpc.xid());
-                println!("{:?}", rpc.payload());
-            }
+
+            let mtype = match rpc.message_type() {
+                Some(OncRpcMessageType::Call) => "C",
+                Some(OncRpcMessageType::Reply) => "R",
+                None => "?",
+            };
+
+            let payload = rpc.payload().unwrap_or(&[]);
+            let payload = &payload[..std::cmp::min(64, payload.len())];
+
+            println!("{},{},{},{}\n{:16.1x}",
+                     i,
+                     mtype,
+                     rpc.xid(),
+                     rpc.looks_like_it_be_what_it_is(),
+                     HexDump(payload));
         }
     }
 }
