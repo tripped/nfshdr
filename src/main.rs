@@ -175,7 +175,7 @@ fn main() {
 
         // WARNING! We play fast and loose here by attempting to interpret
         // every TCP payload as the beginning of an ONC-RPC message, bailing
-        // if it looks like a continuation. This is obviously wrong, but in
+        // if it looks like anything else. This is obviously wrong, but in
         // order to do it correctly, we would need to reconstruct the TCP
         // stream, and frankly, ain't nobody got time for that. (Literally.
         // The slightest delay in pulling data off stdin could cause us to
