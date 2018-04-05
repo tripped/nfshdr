@@ -93,7 +93,7 @@ impl<'a> OncRpcMessage<'a> {
             // The message should have a valid type
             self.message_type().is_some() &&
             // We don't support no stinkin' RFC 1050
-            self.version().unwrap_or(2) == 2 &&
+            self.version().map_or(true, |v| v == 2) &&
             // Who the heck would use ONC-RPC for anything but NFS??
             self.program().map_or(true, |p| p == 100003) &&
             // Incorrect assumption 3: nobody uses NFSv4 (or 2...)
