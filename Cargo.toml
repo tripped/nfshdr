@@ -6,3 +6,7 @@ authors = ["Trip Volpe <trip.volpe@gmail.com>"]
 [dependencies]
 pcap = "*"
 pnet_packet = "*"
+
+[features]
+default = []
+slow = []

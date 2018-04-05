@@ -3,6 +3,7 @@ extern crate pnet_packet;
 
 use pcap::Capture;
 use pnet_packet::{ipv4,tcp};
+use std::mem;
 
 fn tcp_data(data: &[u8]) -> &[u8] {
     // We can skip decoding Ethernet, since the payload of an 802.3
@@ -25,14 +26,31 @@ fn tcp_data(data: &[u8]) -> &[u8] {
 /// Extract a 32-bit network byte order value as a host order u32.
 /// This is the safe version that does all the nice, safe, checked shifting
 /// and bitwise masking. It's also stupefyingly slow, relatively speaking.
-/// Curse you, rust, and your insistence that we
+/// Curse you, Rust, and your insistence that we avoid undefined behavior!
+/// NOTE: I've seen rustc compile code like this down to a single bswapl,
+/// but it doesn't seem to want to do it here.
 #[inline]
+#[cfg(feature = "slow")]
 fn u32be_to_host(data: &[u8], offset: usize) -> u32 {
     let b0 = ((data[offset + 0] as u32) << 24) as u32;
     let b1 = ((data[offset + 1] as u32) << 16) as u32;
     let b2 = ((data[offset + 2] as u32) << 8) as u32;
     let b3 = ((data[offset + 3] as u32)) as u32;
     b0 | b1 | b2 | b3
+}
+
+/// Extract a 32-bit network byte order value as a host order u32.
+/// This is the fast version that compiles to a single bswapl instruction.
+/// Use this if you are a super cool person who drives fast cars while
+/// things explode in your rearview mirror.
+#[cfg(not(feature = "slow"))]
+#[inline(always)]
+fn u32be_to_host(data: &[u8], offset: usize) -> u32 {
+    let val: u32 = unsafe {
+        let ptr = data[offset..].as_ptr() as *const u32;
+        mem::transmute(*ptr)
+    };
+    u32::from_be(val)
 }
 
 /// ONC-RPC message type.
