@@ -35,96 +35,141 @@ fn tcp_data_from_reassembled_ethernet(data: &[u8])
     (tcp, &data[segment_start..segment_end])
 }
 
-#[derive(Hash, Eq, PartialEq, Debug)]
+/// Models one end of an ONC-RPC dialogue. Feed it TCP segments and it
+/// will periodically excrete an ONC-RPC message!
 struct Conversation {
+    /// Whether the conversation has seen at least one valid ONC-RPC message.
     started: bool,
+
+    /// The current highest-observed sequence number in the TCP stream.
     sequence: u32,
+
+    /// The sequence position at which we expect to see the next message.
     next: u32,
-}
 
-/// Extracts ONC-RPC messages from a stream of TCP goop.
-struct RpcStream {
-    /// Map of destination port -> (sequence, next_rpc_offset). This should be
-    /// a good enough state, assuming the input capture only includes one TCP
-    /// conversation, or only conversations between two IP addresses!
-    conversations: HashMap<u16, Conversation>,
-
-    /// 1KiB of buffer ought to be enough for anybody
+    /// 1KiB of buffer ought to be enough for anybody.
+    /// XXX: currently unused.
     buffer: [u8;1024],
 }
 
-impl RpcStream {
-    pub fn new() -> RpcStream {
-        RpcStream {
-            conversations: HashMap::new(),
+impl Conversation {
+    pub fn new(seq: u32) -> Conversation {
+        Conversation {
+            started: false,
+            sequence: seq,
+            next: seq,
             buffer: [0;1024],
         }
     }
 
-    /// Return the Conversation the given TCP segment is associated with.
-    /// Creates it using the segment's current sequence number if it does
-    /// not already exist in our map.
-    fn conversation_for(&mut self, seg: &tcp::TcpPacket) -> &mut Conversation {
-        self.conversations
-            .entry(seg.get_destination())
-            .or_insert(Conversation{
-                started: false,
-                sequence: seg.get_sequence(),
-                next: seg.get_sequence(),
-            })
-    }
-
-    /// Shove another packet into the stream!
-    /// XXX: this assumes that `data` is a reassembled "ethernet" frame
-    /// containing one IP packet (currently just IPv4), as libpcap would
-    /// provide.
-    pub fn update(&mut self, i: u32, data: &[u8]) {
-        let (tcp, segment) = tcp_data_from_reassembled_ethernet(data);
-
-        // Find the conversation record for this end of the stream
-        let mut conv = self.conversation_for(&tcp);
-
-        // Before we've latched on to a known ONC-RPC message, we have to
-        // search for one. In general this is not easy; if we don't already
-        // know where we are in the RPC conversation, we have to look at
-        // every byte of every TCP segment and try to match it against what
-        // we think an ONC-RPC header should look like. For now, though, we
-        // assume that the first segment with a large enough payload contains
-        // an ONC-RPC header at offset 0. This is true in our test data, and
-        // should usually be true if you start the capture *before* beginning
-        // any RPC traffic.
-
-        // Update the state of the conversation, including if we've just
-        // detected the initial RPC message.
-        conv.sequence = tcp.get_sequence();
-        if !conv.started && segment.len() > 20 { // super crappy!
-            conv.started = true;
-            conv.next = conv.sequence;
+    /// Advance the state of the conversation by processing a TCP segment
+    /// header and data. Return Some(message) if the segment contained a
+    /// full ONC-RPC header.
+    ///
+    /// N.B.: this process depends on being able to "latch on" to a valid
+    /// ONC-RPC message at some point in order to transition from "unstarted"
+    /// to "started." Currently, this works by assuming that the first
+    /// segment that could possibly contain an RPC message has one at offset
+    /// zero. In general, it would be necessary to examine every byte of
+    /// every segment and apply some heuristic to decide if it looks like
+    /// an ONC-RPC header, but we don't do anything fancy yet.
+    ///
+    /// The current behavior is likely to work as long as the capture
+    /// contains the *start* of the RPC traffic.
+    ///
+    /// TODO: add fancy RPC detection in the unstarted state
+    /// TODO: needs to buffer for incomplete RPC headers.
+    pub fn update<'a>(&mut self, i: u32, tcp: &tcp::TcpPacket, data: &'a [u8])
+            -> Option<OncRpcMessage<'a>>
+    {
+        self.sequence = tcp.get_sequence();
+        if !self.started && data.len() > 20 { // super crappy!
+            self.started = true;
+            self.next = self.sequence;
         }
 
-        if conv.started {
-            // Is the next RPC position inside this segment?
-            let start = conv.sequence;
-            let end = start + segment.len() as u32;
-            if conv.next >= start && conv.next < end {
+        let start = self.sequence;
+        let end = start + data.len() as u32;
 
-                let offset = (conv.next - start) as usize;
-                println!("Frame {} dst={} seq={} size={}",
-                        i, tcp.get_destination(), conv.sequence, segment.len());
-                println!("Next={}", conv.next);
-                println!("Segment contains RPC message at {}", offset);
+        // Is the next RPC position inside this segment?
+        if self.started && (self.next >= start && self.next < end) {
+            let offset = (self.next - start) as usize;
+            println!("Frame {} dst={} seq={} size={}",
+                    i, tcp.get_destination(), self.sequence, data.len());
+            println!("Next={}", self.next);
+            println!("Segment contains RPC message at {}", offset);
 
-                let rpc_snippet = &segment[
-                    offset..std::cmp::min(offset+64, segment.len())];
+            let rpc_snippet = &data[
+                offset..std::cmp::min(offset+64, data.len())];
 
-                println!("{:16.1x}", HexDump(rpc_snippet));
+            println!("{:16.1x}", HexDump(rpc_snippet));
 
-                // XXX: ASSUMES THE ENTIRE RPC HEADER IS IN THIS SEGMENT!!
-                let rpc = OncRpcMessage::new(&segment[offset..]).unwrap();
+            // XXX: ASSUMES THE ENTIRE RPC HEADER IS IN THIS SEGMENT!!
+            let rpc = OncRpcMessage::new(&data[offset..]).unwrap();
 
-                let cur_size = rpc.fragment_length() + 4;
-                println!("Next RPC in {} bytes", cur_size);
-                conv.next += cur_size;
+            let cur_size = rpc.fragment_length() + 4;
+            println!("Next RPC in {} bytes", cur_size);
+            self.next += cur_size;
+
+            Some(rpc)
+        } else {
+            None
+        }
+    }
+}
+
+/// Extracts ONC-RPC messages from a stream of TCP goop.
+struct RpcStream<T: pcap::Activated> {
+    /// The packet capture from which to acquire TCP goop.
+    capture: pcap::Capture<T>,
+    count: u32,
+
+    /// Map of destination port -> (sequence, next_rpc_offset). This should be
+    /// a good enough state, assuming the input capture only includes one TCP
+    /// conversation, or only conversations between two IP addresses!
+    conversations: HashMap<u16, Conversation>,
+}
+
+impl<T: pcap::Activated> RpcStream<T> {
+    pub fn new(capture: pcap::Capture<T>) -> RpcStream<T> {
+        RpcStream {
+            capture: capture,
+            count: 0,
+            conversations: HashMap::new(),
+        }
+    }
+
+    /// Return the next OncRpcMessage from the capture, blocking as needed
+    /// until enough data is observed to identify it.
+    ///
+    /// XXX: this should probably be a proper iterator.
+    pub fn next(&mut self) -> Result<u32, pcap::Error> {
+
+        loop {
+            let packet = self.capture.next()?;
+            let (tcp, segment) =
+                tcp_data_from_reassembled_ethernet(packet.data);
+
+            // Find the conversation record for this end of the stream
+            let mut conv = self.conversations
+                .entry(tcp.get_destination())
+                .or_insert(Conversation::new(tcp.get_sequence()));
+
+            // One more packet on the pile
+            self.count += 1;
+
+            // XXX: this should be returning the message itself, not just
+            // the frame number; however, we'll need to restructure this a
+            // bit to avoid falling into the "can't borrow mutably more than
+            // once" trap. (Allowing msg to escape the loop extends the
+            // mutable borrow on self.capture. This isn't over-cautious, as
+            // msg contains a slice of the data yielded by the previous call
+            // to self.capture.next(), which is only valid until the next
+            // call! So we need to adopt a structure that allows us to prove
+            // to the Rust compiler that the packet data is never still
+            // borrowed at the time we call capture.next())
+            if let Some(msg) = conv.update(self.count, &tcp, segment) {
+                return Ok(self.count)
             }
         }
     }
@@ -339,10 +384,9 @@ impl<'a> std::fmt::UpperHex for HexDump<'a> {
 fn main() {
     // XXX: yeah, yeah, yeah, use try!
     let mut cap = Capture::from_raw_fd(0).unwrap();
-    let mut stream = RpcStream::new();
-    let mut i = 0;
-    while let Ok(packet) = cap.next() {
-        i += 1;
-        stream.update(i, packet.data);
+    let mut stream = RpcStream::new(cap);
+
+    while let Ok(msg) = stream.next() {
+        println!("Got RPC message with xid = {}", msg);
     }
 }
