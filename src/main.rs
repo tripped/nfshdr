@@ -139,12 +139,23 @@ impl<T: pcap::Activated> RpcStream<T> {
         }
     }
 
-    /// Return the next OncRpcMessage from the capture, blocking as needed
-    /// until enough data is observed to identify it.
+    /// Consume all OncRpcMessages in the capture, calling `func` once for
+    /// each one. In real-time captures, `func` should be very, very fast.
+    /// Don't waste a single nanosecond!
     ///
-    /// XXX: this should probably be a proper iterator.
-    pub fn next(&mut self) -> Result<u32, pcap::Error> {
-
+    /// XXX: this should probably have an iterator interface, but doing that
+    /// is difficult without resorting to RefCell or other tricks. The naive
+    /// implementation is to implement next() with a loop that breaks and
+    /// returns an OncRpcMessage when a packet contains one; however this
+    /// runs afoul of the "can't borrow mutably more than once" rule, as
+    /// allowing the message to escape this scope extends the borrow on
+    /// self.capture. We might be able to get around this by being clever
+    /// with lifetimes...
+    ///
+    /// XXX: also, this currently always returns an Error by hitting the
+    /// end of the capture. Could be cleaner!
+    pub fn each<F>(&mut self, func: F) -> Result<(), pcap::Error>
+            where F: Fn(&OncRpcMessage) -> () {
         loop {
             let packet = self.capture.next()?;
             let (tcp, segment) =
@@ -158,20 +169,11 @@ impl<T: pcap::Activated> RpcStream<T> {
             // One more packet on the pile
             self.count += 1;
 
-            // XXX: this should be returning the message itself, not just
-            // the frame number; however, we'll need to restructure this a
-            // bit to avoid falling into the "can't borrow mutably more than
-            // once" trap. (Allowing msg to escape the loop extends the
-            // mutable borrow on self.capture. This isn't over-cautious, as
-            // msg contains a slice of the data yielded by the previous call
-            // to self.capture.next(), which is only valid until the next
-            // call! So we need to adopt a structure that allows us to prove
-            // to the Rust compiler that the packet data is never still
-            // borrowed at the time we call capture.next())
             if let Some(msg) = conv.update(self.count, &tcp, segment) {
-                return Ok(self.count)
+                func(&msg);
             }
         }
+        Ok(())
     }
 }
 
@@ -386,7 +388,7 @@ fn main() {
     let mut cap = Capture::from_raw_fd(0).unwrap();
     let mut stream = RpcStream::new(cap);
 
-    while let Ok(msg) = stream.next() {
-        println!("Got RPC message with xid = {}", msg);
-    }
+    stream.each(|msg| {
+        println!("Got RPC message with xid = {}", msg.xid());
+    }).ok();
 }
