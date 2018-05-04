@@ -555,7 +555,6 @@ fn main() {
         .map(|d| d.version(version))
         .and_then(|d| d.deserialize())
         .unwrap_or_else(|e| e.exit());
-    println!("{:?}", args);
 
     if args.cmd_list {
         for d in Device::list().ok().unwrap() {
