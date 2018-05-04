@@ -21,6 +21,7 @@ Options:
   -r --file FILE        Read packets offline from a capture file.
   -f --filter FILTER    Filter packets using the BPF string. [default: ]
   -m --max N            Stop after observing N messages. [default: 0]
+  -s --stats            Print statistics to stderr when capture stops.
 
 Commands:
   list                  List available network interfaces.
@@ -33,6 +34,7 @@ struct Args {
     flag_file: Option<String>,
     flag_filter: String,
     flag_max: u32,
+    flag_stats: bool,
 }
 
 /// Given a u8 slice containing a reassembled Ethernet "packet", return
@@ -108,7 +110,7 @@ impl Conversation {
     ///
     /// TODO: add fancy RPC detection in the unstarted state
     /// TODO: needs to buffer for incomplete RPC headers.
-    pub fn update<'a>(&mut self, i: u32, tcp: &tcp::TcpPacket, data: &'a [u8])
+    pub fn update<'a>(&mut self, tcp: &tcp::TcpPacket, data: &'a [u8])
             -> Option<(OncRpcMessage<'a>, &'a [u8])>
     {
         self.sequence = tcp.get_sequence();
@@ -139,11 +141,28 @@ impl Conversation {
     }
 }
 
+/// Statistics about an RPC capture session.
+#[derive(Default)]
+struct RpcStats {
+    // From libpcap
+    received: u32,
+    dropped: u32,
+    dropped_by_iface: u32,
+
+    // From RpcStream
+    frames: u32,
+    calls: u32,
+    replies: u32,
+    other: u32,
+}
+
 /// Extracts ONC-RPC messages from a stream of TCP goop.
 struct RpcStream<T: pcap::Activated> {
     /// The packet capture from which to acquire TCP goop.
     capture: pcap::Capture<T>,
-    count: u32,
+
+    /// Statistics
+    stats: RpcStats,
 
     /// Map of destination port -> (sequence, next_rpc_offset). This should be
     /// a good enough state, assuming the input capture only includes one TCP
@@ -155,7 +174,7 @@ impl<T: pcap::Activated> RpcStream<T> {
     pub fn new(capture: pcap::Capture<T>) -> RpcStream<T> {
         RpcStream {
             capture: capture,
-            count: 0,
+            stats: RpcStats::default(),
             conversations: HashMap::new(),
         }
     }
@@ -189,18 +208,36 @@ impl<T: pcap::Activated> RpcStream<T> {
                 .or_insert(Conversation::new(tcp.get_sequence()));
 
             // One more packet on the pile
-            self.count += 1;
+            self.stats.frames += 1;
 
-            if let Some((msg, data)) = conv.update(self.count, &tcp, segment) {
-                if !func(self.count, &msg, data) {
+            if let Some((msg, data)) = conv.update(&tcp, segment) {
+                match msg.message_type() {
+                    Some(OncRpcMessageType::Call) => self.stats.calls += 1,
+                    Some(OncRpcMessageType::Reply) => self.stats.replies += 1,
+                    _ => self.stats.other += 1,
+                }
+
+                if !func(self.stats.frames, &msg, data) {
                     break;
                 }
             }
         }
 
-        eprintln!(">>> stats:\n{:?}", self.capture.stats().ok().unwrap());
-
         Ok(())
+    }
+
+    /// Return capture and RPC message statistics.
+    ///
+    /// XXX: it's a little weird that this is mut, but self.capture.stats()
+    /// requires it at any rate.
+    pub fn stats(&mut self) -> Result<RpcStats, pcap::Error> {
+        let pcap_stats = self.capture.stats()?;
+        Ok(RpcStats {
+            received: pcap_stats.received,
+            dropped: pcap_stats.dropped,
+            dropped_by_iface: pcap_stats.if_dropped,
+            ..self.stats
+        })
     }
 }
 
@@ -443,7 +480,7 @@ impl<'a> std::fmt::UpperHex for HexDump<'a> {
 /// RpcStream<pcap::Active> and RpcStream<pcap::Offline>.
 fn process_messages<T: pcap::Activated>(
         mut stream: RpcStream<T>,
-        args: &Args) {
+        args: &Args) -> Result<(), pcap::Error> {
     let mut count = 0;
     let max = args.flag_max;
     stream.each(|i, msg, data| {
@@ -458,6 +495,21 @@ fn process_messages<T: pcap::Activated>(
         count += 1;
         max == 0 || count < max
     }).ok();
+
+    if args.flag_stats {
+        let stats = stream.stats()?;
+        eprintln!("{} frames received\n\
+                  {} dropped\n\
+                  {} dropped by interface\n\
+                  {} frames processed\n\
+                  {} RPC calls\n\
+                  {} RPC replies\n\
+                  {} RPC unrecognized",
+                  stats.received, stats.dropped, stats.dropped_by_iface,
+                  stats.frames, stats.calls, stats.replies, stats.other);
+    }
+
+    Ok(())
 }
 
 fn main() {
@@ -482,9 +534,9 @@ fn main() {
     let filter = &args.flag_filter;
 
     if let Some(ref filename) = args.flag_file {
-        process_messages(RpcStream::from_file(filename, filter), &args);
+        process_messages(RpcStream::from_file(filename, filter), &args).ok();
     } else {
-        process_messages(RpcStream::from_device(interface, filter), &args);
+        process_messages(RpcStream::from_device(interface, filter), &args).ok();
     }
 
 }
