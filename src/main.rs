@@ -1,10 +1,39 @@
+extern crate docopt;
 extern crate pcap;
 extern crate pnet_packet;
+#[macro_use] extern crate serde_derive;
 
-use pcap::Capture;
+use docopt::Docopt;
+use pcap::{Capture, Device};
 use pnet_packet::{ipv4,tcp};
 use std::collections::HashMap;
 use std::mem;
+
+const USAGE: &'static str = "
+nfshdr - trace NFS traffic from a packet capture.
+
+Usage:
+  nfshdr [options] (-i IFACE|-r FILE)
+  nfshdr list
+
+Options:
+  -i --interface IFACE  Capture packets from IFACE. [default: any]
+  -r --file FILE        Read packets offline from a capture file.
+  -f --filter FILTER    Filter packets using the BPF string. [default: ]
+  -m --max N            Stop after observing N messages. [default: 0]
+
+Commands:
+  list                  List available network interfaces.
+";
+
+#[derive(Debug, Deserialize)]
+struct Args {
+    cmd_list: bool,
+    flag_interface: String,
+    flag_file: Option<String>,
+    flag_filter: String,
+    flag_max: u32,
+}
 
 /// Given a u8 slice containing a reassembled Ethernet "packet", return
 /// a TcpPacket representing the inner TCP header, and a u8 slice spanning
@@ -80,7 +109,7 @@ impl Conversation {
     /// TODO: add fancy RPC detection in the unstarted state
     /// TODO: needs to buffer for incomplete RPC headers.
     pub fn update<'a>(&mut self, i: u32, tcp: &tcp::TcpPacket, data: &'a [u8])
-            -> Option<OncRpcMessage<'a>>
+            -> Option<(OncRpcMessage<'a>, &'a [u8])>
     {
         self.sequence = tcp.get_sequence();
         if !self.started && data.len() > 20 { // super crappy!
@@ -89,29 +118,21 @@ impl Conversation {
         }
 
         let start = self.sequence;
-        let end = start + data.len() as u32;
+        let end = start.wrapping_add(data.len() as u32);
 
         // Is the next RPC position inside this segment?
         if self.started && (self.next >= start && self.next < end) {
             let offset = (self.next - start) as usize;
-            println!("Frame {} dst={} seq={} size={}",
-                    i, tcp.get_destination(), self.sequence, data.len());
-            println!("Next={}", self.next);
-            println!("Segment contains RPC message at {}", offset);
-
             let rpc_snippet = &data[
                 offset..std::cmp::min(offset+64, data.len())];
-
-            println!("{:16.1x}", HexDump(rpc_snippet));
 
             // XXX: ASSUMES THE ENTIRE RPC HEADER IS IN THIS SEGMENT!!
             let rpc = OncRpcMessage::new(&data[offset..]).unwrap();
 
             let cur_size = rpc.fragment_length() + 4;
-            println!("Next RPC in {} bytes", cur_size);
-            self.next += cur_size;
+            self.next = self.next.wrapping_add(cur_size);
 
-            Some(rpc)
+            Some((rpc, rpc_snippet))
         } else {
             None
         }
@@ -154,14 +175,15 @@ impl<T: pcap::Activated> RpcStream<T> {
     ///
     /// XXX: also, this currently always returns an Error by hitting the
     /// end of the capture. Could be cleaner!
-    pub fn each<F>(&mut self, func: F) -> Result<(), pcap::Error>
-            where F: Fn(&OncRpcMessage) -> () {
+    pub fn each<F>(&mut self, mut func: F) -> Result<(), pcap::Error>
+            where F: FnMut(u32, &OncRpcMessage, &[u8]) -> bool {
         loop {
             let packet = self.capture.next()?;
             let (tcp, segment) =
                 tcp_data_from_reassembled_ethernet(packet.data);
 
-            // Find the conversation record for this end of the stream
+            // Find the conversation record for this end of the stream.
+            // XXX: might be an undesirable place for a possible allocation.
             let mut conv = self.conversations
                 .entry(tcp.get_destination())
                 .or_insert(Conversation::new(tcp.get_sequence()));
@@ -169,11 +191,40 @@ impl<T: pcap::Activated> RpcStream<T> {
             // One more packet on the pile
             self.count += 1;
 
-            if let Some(msg) = conv.update(self.count, &tcp, segment) {
-                func(&msg);
+            if let Some((msg, data)) = conv.update(self.count, &tcp, segment) {
+                if !func(self.count, &msg, data) {
+                    break;
+                }
             }
         }
+
+        eprintln!(">>> stats:\n{:?}", self.capture.stats().ok().unwrap());
+
         Ok(())
+    }
+}
+
+impl RpcStream<pcap::Offline> {
+    /// Create a new RpcStream from a filename. "-" means stdin.
+    pub fn from_file(name: &str, filter: &str) -> RpcStream<pcap::Offline> {
+        let mut cap = match name {
+            "-" => Capture::from_raw_fd(0),
+            _ => Capture::from_file(name)
+        }.unwrap();
+        cap.filter(filter).ok();
+        RpcStream::new(cap)
+    }
+}
+
+impl RpcStream<pcap::Active> {
+    /// Create a new RpcStream from a device.
+    pub fn from_device(name: &str, filter: &str) -> RpcStream<pcap::Active> {
+        let mut cap = Capture::from_device(Device {
+            name: name.into(),
+            desc: None
+        }).unwrap().open().unwrap();
+        cap.filter(filter).ok();
+        RpcStream::new(cap)
     }
 }
 
@@ -208,9 +259,11 @@ fn u32be_to_host(data: &[u8], offset: usize) -> u32 {
 }
 
 /// ONC-RPC message type.
+#[derive(Debug)]
 enum OncRpcMessageType {
     Call,
-    Reply
+    Reply,
+    Unknown,
 }
 
 /// Wraps borrowed packet data with methods *almost* conforming to RFC 5531.
@@ -383,12 +436,55 @@ impl<'a> std::fmt::UpperHex for HexDump<'a> {
     }
 }
 
-fn main() {
-    // XXX: yeah, yeah, yeah, use try!
-    let mut cap = Capture::from_raw_fd(0).unwrap();
-    let mut stream = RpcStream::new(cap);
+/// Iterate over all the RPC messages in a stream, processing each one
+/// according to `args`.
+///
+/// This exists as a generic function because otherwise it's hard to unify
+/// RpcStream<pcap::Active> and RpcStream<pcap::Offline>.
+fn process_messages<T: pcap::Activated>(
+        mut stream: RpcStream<T>,
+        args: &Args) {
+    let mut count = 0;
+    let max = args.flag_max;
+    stream.each(|i, msg, data| {
+        println!("{} [{:?} ({}):{:x}] {} bytes\n{:16.1x}\n",
+            i,
+            msg.message_type().unwrap_or(OncRpcMessageType::Unknown),
+            msg.procedure().unwrap_or(0),
+            msg.xid(),
+            msg.fragment_length(),
+            HexDump(data));
 
-    stream.each(|msg| {
-        println!("Got RPC message with xid = {}", msg.xid());
+        count += 1;
+        max == 0 || count < max
     }).ok();
+}
+
+fn main() {
+    let version = Some(
+        env!("CARGO_PKG_NAME").to_string() + " version " +
+        env!("CARGO_PKG_VERSION"));
+
+    let args: Args = Docopt::new(USAGE)
+        .map(|d| d.version(version))
+        .and_then(|d| d.deserialize())
+        .unwrap_or_else(|e| e.exit());
+    println!("{:?}", args);
+
+    if args.cmd_list {
+        for d in Device::list().ok().unwrap() {
+            println!("{:19} {}", d.name, d.desc.unwrap_or("".into()));
+        }
+        return;
+    }
+
+    let interface = &args.flag_interface;
+    let filter = &args.flag_filter;
+
+    if let Some(ref filename) = args.flag_file {
+        process_messages(RpcStream::from_file(filename, filter), &args);
+    } else {
+        process_messages(RpcStream::from_device(interface, filter), &args);
+    }
+
 }
