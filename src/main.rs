@@ -211,7 +211,7 @@ impl<T: pcap::Activated> RpcStream<T> {
 
             // Find the conversation record for this end of the stream.
             // XXX: might be an undesirable place for a possible allocation.
-            let mut conv = self.conversations
+            let conv = self.conversations
                 .entry(tcp.get_destination())
                 .or_insert(Conversation::new(tcp.get_sequence()));
 
