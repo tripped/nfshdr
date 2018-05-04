@@ -80,9 +80,6 @@ struct Conversation {
     /// Whether the conversation has seen at least one valid ONC-RPC message.
     started: bool,
 
-    /// The current highest-observed sequence number in the TCP stream.
-    sequence: u32,
-
     /// The sequence position at which we expect to see the next message.
     next: u32,
 
@@ -95,7 +92,6 @@ impl Conversation {
     pub fn new(seq: u32) -> Conversation {
         Conversation {
             started: false,
-            sequence: seq,
             next: seq,
             buffer: [0;1024],
         }
@@ -121,13 +117,13 @@ impl Conversation {
     pub fn update<'a>(&mut self, tcp: &tcp::TcpPacket, data: &'a [u8])
             -> Option<(OncRpcMessage<'a>, &'a [u8])>
     {
-        self.sequence = tcp.get_sequence();
+        let sequence = tcp.get_sequence();
         if !self.started && data.len() > 20 { // super crappy!
             self.started = true;
-            self.next = self.sequence;
+            self.next = sequence;
         }
 
-        let start = self.sequence;
+        let start = sequence;
         let end = start.wrapping_add(data.len() as u32);
 
         // Is the next RPC position inside this segment?
