@@ -7,7 +7,9 @@ use docopt::Docopt;
 use pcap::{Capture, Device};
 use pnet_packet::{ipv4,tcp};
 use std::collections::HashMap;
+use std::io::{Error, ErrorKind};
 use std::mem;
+use std::process::exit;
 
 const USAGE: &'static str = "
 nfshdr - trace NFS traffic from a packet capture.
@@ -15,13 +17,18 @@ nfshdr - trace NFS traffic from a packet capture.
 Usage:
   nfshdr [options] (-i IFACE|-r FILE)
   nfshdr list
+  nfshdr [--version|--help]
 
 Options:
   -i --interface IFACE  Capture packets from IFACE. [default: any]
   -r --file FILE        Read packets offline from a capture file.
-  -f --filter FILTER    Filter packets using the BPF string. [default: ]
+  -f --filter FILTER    Filter packets using BPF string. [default: ]
+  -b --bufsize SIZE     Capture buffer size. [default: 32M]
   -m --max N            Stop after observing N messages. [default: 0]
   -s --stats            Print statistics to stderr when capture stops.
+
+  -h --help             Show this message.
+  -v --version          Show version.
 
 Commands:
   list                  List available network interfaces.
@@ -33,6 +40,7 @@ struct Args {
     flag_interface: String,
     flag_file: Option<String>,
     flag_filter: String,
+    flag_bufsize: String,
     flag_max: u32,
     flag_stats: bool,
 }
@@ -255,11 +263,16 @@ impl RpcStream<pcap::Offline> {
 
 impl RpcStream<pcap::Active> {
     /// Create a new RpcStream from a device.
-    pub fn from_device(name: &str, filter: &str) -> RpcStream<pcap::Active> {
+    pub fn from_device(name: &str, filter: &str, bufsize: i32)
+            -> RpcStream<pcap::Active> {
         let mut cap = Capture::from_device(Device {
             name: name.into(),
             desc: None
-        }).unwrap().open().unwrap();
+        }).unwrap()
+            .buffer_size(bufsize)
+            .open()
+            .unwrap();
+
         cap.filter(filter).ok();
         RpcStream::new(cap)
     }
@@ -512,6 +525,27 @@ fn process_messages<T: pcap::Activated>(
     Ok(())
 }
 
+/// Parse a string like "32K" or "200G" into a number of bytes.
+fn parse_byte_size(spec: &str) -> Result<i32, Error> {
+    let (size, unit) = spec.split_at(spec.len() - 1);
+    let size = size.parse::<i32>()
+        .map_err(|e| Error::new(ErrorKind::Other, e))?;
+
+    match unit.to_uppercase().as_ref() {
+        "B" => Ok(size),
+        "K" => Ok(size << 10),
+        "M" => Ok(size << 20),
+        "G" => Ok(size << 30),
+        "P" => Err("How much RAM do you think you have?"),
+        "E" => Err("I don't care if you want exabytes or exbibytes. \
+                    It ain't happening."),
+        "Z" => Err("When you have zettabytes of memory, give me a call."),
+        "Y" => Err("Yottabytes may be a lottabytes, but you don't have \
+                    that much RAM."),
+        _ => Err("Unrecognized suffix"),
+    }.map_err(|e| Error::new(ErrorKind::Other, e))
+}
+
 fn main() {
     let version = Some(
         env!("CARGO_PKG_NAME").to_string() + " version " +
@@ -532,11 +566,19 @@ fn main() {
 
     let interface = &args.flag_interface;
     let filter = &args.flag_filter;
+    let bufsize = &args.flag_bufsize;
+
+    // Parse the buffer size specifier.
+    let bufsize = parse_byte_size(bufsize).unwrap_or_else(|e| {
+        eprintln!("Bad buffer size '{}': {}", bufsize, e);
+        exit(1)
+    });
 
     if let Some(ref filename) = args.flag_file {
-        process_messages(RpcStream::from_file(filename, filter), &args).ok();
+        process_messages(RpcStream::from_file(
+            filename, filter), &args).ok();
     } else {
-        process_messages(RpcStream::from_device(interface, filter), &args).ok();
+        process_messages(RpcStream::from_device(
+            interface, filter, bufsize), &args).ok();
     }
-
 }
