@@ -123,12 +123,21 @@ impl Conversation {
             self.next = sequence;
         }
 
-        let start = sequence;
-        let end = start.wrapping_add(data.len() as u32);
+        let start: u64 = sequence as u64;
+        let end: u64 = start + data.len() as u64;
+
+        // If 'next' is less than the current sequence number, the sequence
+        // number must have wrapped. In this case, we can add 1<<32 to
+        // 'next' to place it in the correct relative range.
+        let next: u64 = if self.next < sequence {
+            self.next as u64 + 1<<32
+        } else {
+            self.next as u64
+        };
 
         // Is the next RPC position inside this segment?
-        if self.started && (self.next >= start && self.next < end) {
-            let offset = (self.next - start) as usize;
+        if self.started && (start <= next && next < end) {
+            let offset = (next - start) as usize;
             let rpc_snippet = &data[
                 offset..std::cmp::min(offset+64, data.len())];
 
@@ -143,6 +152,50 @@ impl Conversation {
             None
         }
     }
+}
+
+#[test]
+fn conversation_handles_segment_that_wraps_seq() {
+    // "Next" may have wrapped; e.g., if we saw a 100-byte message at
+    // sequence 2^32 - 100. We would then expect to see a message at
+    // sequence 0. If the fragment boundaries were so aligned that the
+    // next segment began at sequence 2^32-1, we might erroneously
+    // conclude that our "next" offset lies outside the current segment.
+    let mut conv = Conversation {
+        started: true,
+        next: 0,
+        buffer: [0;1024],
+    };
+
+    let tcp_header = tcp::TcpPacket::owned(vec![
+        0x03, 0x1e,                 // Source port = 798
+        0x08, 0x01,                 // Destination port = 2049
+        0xff, 0xff, 0xff, 0xff,     // Sequence = 2^32 - 1
+        0x00, 0x00, 0x00, 0x01,     // Acknowledgement = 1
+        0x50, 0x18,                 // Header=5, flags=[.......AP...]
+        0x00, 0xe5,                 // Window size = 229
+        0x00, 0x00,                 // Checksum = 0
+        0x00, 0x00,                 // Urgent pointer = 0
+    ]).unwrap();
+
+    let segment_data = [
+        0x00,                       // Last byte of previous message
+        // New RPC message begins here
+        0x80, 0x00, 0x00, 0x64,     // Last fragment, length=100
+        0x4f, 0x8e, 0xb6, 0x1a,     // XID = 0x4f8eb61a
+        0x00, 0x00, 0x00, 0x00,     // Message type = 0 (Call)
+        0x00, 0x00, 0x00, 0x02,     // Version = 2
+        0x00, 0x01, 0x86, 0xa3,     // Program = 100003 (NFS)
+        0x00, 0x00, 0x00, 0x03,     // Program version = 3
+        0x00, 0x00, 0x00, 0x04,     // Procedure = 4 (NFS3_ACCESS)
+        // In a real packet, there would be more stuff below
+    ];
+
+    let result = conv.update(&tcp_header, &segment_data);
+
+    // The Conversation should correctly identify the RPC message beginning
+    // at offset 1 in this segment.
+    assert_eq!(result.unwrap().0.xid(), 0x4f8eb61a);
 }
 
 /// Statistics about an RPC capture session.
